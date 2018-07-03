@@ -33,9 +33,13 @@ import io.mycat.backend.datasource.PhysicalDBNode;
 import io.mycat.backend.mysql.PacketUtil;
 import io.mycat.config.ErrorCode;
 import io.mycat.config.Fields;
+import io.mycat.config.loader.zkprocess.comm.ZkConfig;
+import io.mycat.config.loader.zkprocess.comm.ZkParamCfg;
 import io.mycat.config.model.SchemaConfig;
+import io.mycat.config.model.SystemConfig;
 import io.mycat.config.model.TableConfig;
 import io.mycat.migrate.MigrateTask;
+import io.mycat.migrate.MigrateTaskWatch;
 import io.mycat.migrate.MigrateUtils;
 import io.mycat.migrate.TaskNode;
 import io.mycat.net.mysql.*;
@@ -49,12 +53,19 @@ import io.mycat.util.ZKUtils;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.api.transaction.CuratorTransactionFinal;
 import org.apache.curator.framework.recipes.locks.InterProcessMutex;
+import org.joda.time.LocalDateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+
+import static io.mycat.config.loader.zkprocess.comm.ZkParamCfg.ZK_CFG_FLAG;
 
 /**
  * todo remove watch
@@ -65,10 +76,11 @@ public final class MigrateHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger("MigrateHandler");
 
     //可以优化成多个锁
-    private static InterProcessMutex slaveIDsLock = new InterProcessMutex(ZKUtils.getConnection(), ZKUtils.getZKBasePath() + "lock/slaveIDs.lock");
-    ;
+    private static final InterProcessMutex slaveIDsLock = new InterProcessMutex(ZKUtils.getConnection(), ZKUtils.getZKBasePath() + "lock/slaveIDs.lock");
     private static final int FIELD_COUNT = 1;
     private static final FieldPacket[] fields = new FieldPacket[FIELD_COUNT];
+    private static volatile boolean forceInit = false;
+
 
     static {
         fields[0] = PacketUtil.getField("TASK_ID",
@@ -87,6 +99,10 @@ public final class MigrateHandler {
 
         String table = map.get("table");
         String add = map.get("add");
+        String timeoutString = map.get("timeout");
+        String charset = map.get("charset");
+        boolean forceBinlog = false;//这个命令禁止使用因为binlog stream的实现依赖mysqldump
+        int timeout = 120;// minute
         String schema = "";
         if (table == null) {
             writeErrMessage(c, "table cannot be null");
@@ -101,9 +117,59 @@ public final class MigrateHandler {
             writeErrMessage(c, "add cannot be null");
             return;
         }
+        if (timeoutString != null) {
+            try {
+                timeout = Integer.parseInt(timeoutString);
+                if (timeout <= 0) {
+                    throw new NumberFormatException("");
+                }
+            } catch (Exception e) {
+                writeErrMessage(c, String.format("timeout:%s format is wrong,it should be 1-" + Integer.MAX_VALUE + " (unit:minute)", timeoutString));
+                return;
+            }
+        }
+        if (StringUtil.isEmpty(charset)) {
+            charset = Charset.defaultCharset().name();
+        }
+        if (!Charset.isSupported(charset)) {
+            writeErrMessage(c, "Not support charset " + charset);
+            return;
+        }
+        ZkConfig zkConfig = ZkConfig.getInstance();
+        boolean loadZk = "true".equalsIgnoreCase(zkConfig.getValue(ZK_CFG_FLAG));
+        boolean force = "true".equalsIgnoreCase(map.get("force"));
+        CuratorFramework zk = ZKUtils.getConnection();
+        if (!loadZk) {
+            if (!force) {
+                String msg = "";
+                msg += "Mycat can temporarily execute the migration command.If other mycat does not connect to this zookeeper, they will not be able to perceive changes in the migration task.\n";
+                msg += "You can command as follow:\n\nmigrate -table=schema.test -add=dn2,dn3 -force=true\n\nto perform the migration.\n";
+                LOGGER.error(msg);
+                writeErrMessage(c, msg);
+                return;
+            }
+            //因为loadZk在mycat启动时候没有监听zk里migrate路径，这里需要把这个监听补上
+            //借用slaveIDsLock对象作为同步锁
+            boolean changed = false;
+            if (!forceInit) {
+                synchronized (slaveIDsLock) {
+                    if (!forceInit) {
+                        forceInit = true;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                MigrateTaskWatch.start();
+            }
+        }
+        if (zk == null) {
+            writeErrMessage(c, "Mycat is not connected to zookeeper");
+            return;
+        }
         String taskID = getUUID();
         try {
-            if (StringUtil.isEmpty(schema)){
+            if (StringUtil.isEmpty(schema)) {
                 schema = c.getSchema();
             }
             if (StringUtil.isEmpty(schema)) {
@@ -111,12 +177,12 @@ public final class MigrateHandler {
                 return;
             }
             SchemaConfig schemaConfig = MycatServer.getInstance().getConfig().getSchemas().get(schema);
-            if (Objects.isNull(schemaConfig)) {
+            if (schemaConfig == null) {
                 writeErrMessage(c, String.format("Unknown database '" + schema + "'", table.toUpperCase(), schema));
                 return;
             }
             TableConfig tableConfig = schemaConfig.getTables().get(table.toUpperCase());
-            if (Objects.isNull(tableConfig)) {
+            if (tableConfig == null) {
                 writeErrMessage(c, String.format("Table '%s' doesn't define in schema '%s'\n", table.toUpperCase(), schema));
                 return;
             }
@@ -143,8 +209,14 @@ public final class MigrateHandler {
             if (client.checkExists().forPath(taskBase) != null) {
                 List<String> childTaskList = client.getChildren().forPath(taskBase);
                 for (String child : childTaskList) {
+                    String path = taskBase + "/" + child;
+                    String str = new String(ZKUtils.getConnection().getData().forPath(path));
+                    if (!isJson(str)) {
+                        writeErrMessage(c, path + "in zookeeper is abnormal state,please repair manual!");
+                        return;
+                    }
                     TaskNode taskNode = JSON
-                            .parseObject(ZKUtils.getConnection().getData().forPath(taskBase + "/" + child), TaskNode.class);
+                            .parseObject(str, TaskNode.class);
                     if (taskNode.getSchema().equalsIgnoreCase(schema) && table.equalsIgnoreCase(taskNode.getTable())
                             && taskNode.getStatus() < 5) {
                         writeErrMessage(c, "table: " + table + " previous migrate task is still running,on the same time one table only one task");
@@ -152,6 +224,7 @@ public final class MigrateHandler {
                     }
                 }
             }
+            String backupPath = backup();
             client.create().creatingParentsIfNeeded().forPath(taskPath);
             TaskNode taskNode = new TaskNode();
             taskNode.setSchema(schema);
@@ -159,6 +232,10 @@ public final class MigrateHandler {
             taskNode.setTable(table);
             taskNode.setAdd(add);
             taskNode.setStatus(0);
+            taskNode.setTimeout(timeout);
+            taskNode.setCharset(charset);
+            taskNode.setForceBinlog(forceBinlog);
+            taskNode.setBackupFile(backupPath);
 
             Map<String, Integer> fromNodeSlaveIdMap = new HashMap<>();
 
@@ -189,14 +266,26 @@ public final class MigrateHandler {
 
             //合并成dataHost级别任务
             Map<String, List<MigrateTask>> dataHostMigrateMap = mergerTaskForDataHost(allTaskList);
+
+            String boosterDataHosts = ZkConfig.getInstance().getValue(ZkParamCfg.MYCAT_BOOSTER_DATAHOSTS);
+            Set<String> dataNodes = new HashSet<>(Splitter.on(",").trimResults().omitEmptyStrings().splitToList(boosterDataHosts));
+            boolean isFirst = true;
+            for (String s : dataHostMigrateMap.keySet()) {
+                if (!dataNodes.contains(s)) {
+                    if (isFirst) {
+                        LOGGER.warn("--------------------------------check dataNode--------------------------------");
+                        isFirst = false;
+                    }
+                    LOGGER.warn("dataNode %s will be not participate in migration");
+                }
+            }
+
             for (Map.Entry<String, List<MigrateTask>> entry : dataHostMigrateMap.entrySet()) {
                 String key = entry.getKey();
                 List<MigrateTask> value = entry.getValue();
                 String path = taskPath + "/" + key;
                 transactionFinal = transactionFinal.create().forPath(path, JSON.toJSONBytes(value)).and();
             }
-
-
             transactionFinal.commit();
         } catch (Exception e) {
             LOGGER.error("migrate error", e);
@@ -205,6 +294,7 @@ public final class MigrateHandler {
         }
 
         writePackToClient(c, taskID);
+        LOGGER.info("--------------------------------task created success--------------------------------");
         LOGGER.info("task start", new Date());
     }
 
@@ -363,5 +453,30 @@ public final class MigrateHandler {
             }
         }
         return map;
+    }
+
+    public static String backup() throws Exception {
+        LocalDateTime now = LocalDateTime.now();
+        Path path = Paths.get(SystemConfig.getHomePath()).resolve("backup_" + now.getYear() + "_" + now.getMonthOfYear() + "_" + now.getDayOfMonth() + "_" + now.getHourOfDay() + "_" + now.getMinuteOfHour());
+        if (!Files.exists(path)) {
+            Files.createDirectory(path);
+        }
+        List<String> strings = ZKUtils.getConnection().getChildren().forPath(ZKUtils.getZKBasePath() + "ruledata");
+        for (String s : strings) {
+            byte[] bytes = ZKUtils.getConnection().getData().forPath(ZKUtils.getZKBasePath() + "ruledata/" + s);
+            Files.write(path.resolve(s), bytes);
+        }
+        byte[] bytes = ZKUtils.getConnection().getData().forPath(ZKUtils.getZKBasePath() + "schema/schema");
+        Files.write(path.resolve("schema.json"), bytes);
+        bytes = ZKUtils.getConnection().getData().forPath(ZKUtils.getZKBasePath() + "rules/function");
+        Files.write(path.resolve("function.json"), bytes);
+        return path.toAbsolutePath().toString();
+    }
+
+    private static boolean isJson(String str) {
+        if (StringUtil.isEmpty(str)) return false;
+        str = str.trim();
+        if (str.startsWith("{") && str.endsWith("}")) return true;
+        return false;
     }
 }
